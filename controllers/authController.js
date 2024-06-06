@@ -1,0 +1,255 @@
+const { promisify } = require("util");
+const crypto = require("crypto");
+const User = require("./../models/userModel");
+const jwt = require("jsonwebtoken");
+const sendEmail = require("./../utils/email");
+
+const createToken = (id) => {
+  return jwt.sign({ id }, process.env.JWT_SECRET, {
+    expiresIn: process.env.JWT_EXPIRES_IN,
+  });
+};
+exports.signup = async (req, res, next) => {
+  try {
+    const newUser = await User.create(req.body);
+
+    const token = createToken(newUser._id);
+
+    res.status(201).json({
+      status: "success",
+      data: {
+        token,
+        user: newUser,
+      },
+    });
+  } catch (err) {
+    res.status(400).json({
+      status: "fail",
+      message: err,
+    });
+  }
+};
+
+exports.login = async (req, res, next) => {
+  try {
+    //1.get the email and passsword
+    const { email, password } = req.body;
+
+    //2.check whether email and password is there in request body
+
+    if (!email || !password) {
+      throw new Error("email or password not given");
+    }
+
+    //3.check whether the user is signed up
+
+    const user = await User.findOne({ email }).select("+password"); // select password explicitly
+
+    if (!user || !(await user.correctPassword(password, user.password))) {
+      throw new Error("invalid emal or password");
+    }
+
+    //4.to check whether the password and email matches correctly
+    const token = createToken(user._id);
+
+    res.status(200).json({
+      status: "success",
+      token,
+    });
+
+    next();
+  } catch (err) {
+    res.status(400).json({
+      status: "fail",
+      message: err,
+    });
+
+    return next(err);
+  }
+};
+
+exports.protect = async (req, res, next) => {
+  try {
+    //1) check whether the token is there ,  token has to be provided in the request headers , in authorization field
+    let token;
+    if (
+      req.headers.authorization &&
+      req.headers.authorization.startsWith("Bearer")
+    ) {
+      token = req.headers.authorization.split(" ")[1];
+    }
+    if (!token) {
+      throw new Error("not logged in");
+    }
+
+    //2) verify the token
+    const decoded = await promisify(jwt.verify)(token, process.env.JWT_SECRET);
+    console.log(decoded);
+
+    /*3)check if the user still exists , in case the user was deleted after assigning the token*/
+    console.log(decoded.id);
+    const currentUser = await User.findById(decoded.id);
+    if (!currentUser) {
+      throw new Error("user no more exists");
+    }
+
+    /*4) check if the password was changed after user was assigned the token ,
+         in case somebody stolen the token and user changed the password*/
+
+    if (currentUser.changedPasswordAfter(decoded.iat)) {
+      throw new Error("password was changed");
+    }
+
+    req.user = currentUser;
+    next();
+  } catch (err) {
+    res.status(401).json({
+      status: "fail",
+      message: err,
+    });
+    return next(err);
+  }
+};
+
+exports.restrictTo = (...roles) => {
+  //roles['admin','lead-guide']
+  //this is a wrapper function because we cant provide arbitary parameters to middleware
+  return (req, res, next) => {
+    //this is the middleware which will be returned by the outside function
+    try {
+      if (!roles.includes(req.user.role)) {
+        throw new Error("you donot have permission to perform the operation ");
+      }
+      next();
+    } catch (err) {
+      res.status(403).json({
+        status: "fail",
+        message: err,
+      });
+      return next(err);
+    }
+  };
+};
+
+exports.forgotPassword = async (req, res, next) => {
+  try {
+    //1) store the user email from the post  request
+    const user = await User.findOne({ email: req.body.email });
+
+    if (!user) {
+      throw new Error("there is no user with this email");
+    }
+
+    //2)generate the random reset token. Create an instance method in userModel
+    const resetToken = user.createResetPasswordToken();
+    await user.save({ validateBeforeSave: false });
+
+    //3)send the reset link to user's email
+
+    const resetURL = `${req.protocol}://${req.get(
+      "host"
+    )}/api/v1/users/reset-password/${resetToken}`;
+
+    const message = `forgot your password ? submt a patch request with password and confirmPassword at the URL ${resetURL}\n if you didnt forget password , then ignore this email!`;
+
+    try {
+      await sendEmail({
+        email: user.email,
+        subject: "your forgot password token (valid for only 10 min)",
+        message,
+      });
+
+      res.status(200).json({
+        status: "success",
+        message: "token sent to email!",
+      });
+    } catch (err) {
+      user.passwordResetToken = undefined;
+      user.passwordResetExpires = undefined;
+      await user.save({ validateBeforeSave: false });
+      res.status(500).json({
+        status: "fail",
+        message: err,
+      });
+      console.log(err);
+      return new Error("there was a problem sending email , please try again");
+    }
+  } catch (err) {
+    return next(err);
+  }
+};
+
+exports.resetPassword = async (req, res, next) => {
+  // this middleware will recieve the token generated by forgot password in the request parameter
+  try {
+    //1)encrypt the token and check for the user in database with the same token
+    const hashedToken = crypto
+      .createHash("sha256")
+      .update(req.params.token)
+      .digest("hex");
+
+    const user = await User.findOne({
+      passwordResetToken: hashedToken,
+      passwordResetExpires: { $gt: Date.now() },
+    });
+
+    if (!user) {
+      throw new Error("token is invliad or has expired");
+    }
+    //2)if user is found and the token is not expired then set the password
+    user.password = req.body.password;
+    user.passwordConfirm = req.body.passwordConfirm;
+    user.passwordResetToken = undefined;
+    user.passwordResetExpires = undefined;
+    await user.save();
+    console.log(user.passwordChangedAt);
+    //3)update changedPasswordAt property in schema in order to authenticate against JWT
+
+    //4)Login the user with new JWT
+    const token = createToken(user.id);
+    res.status(200).json({
+      status: "success",
+      token,
+    });
+  } catch (err) {
+    res.status(400).json({
+      status: "fail",
+      err,
+    });
+    return next(err);
+  }
+};
+
+exports.updatePassword = async (req, res, next) => {
+  try {
+    //1)check user from collection
+
+    const user = await User.findById(req.user.id).select("+password");
+
+    //2)check if the password posted is correct or not
+
+    if (!(await user.correctPassword(req.body.currentPassword, user.password))) {
+      throw new Error("invalid password");
+    }
+
+    //3)if correct then update the password
+
+    user.password = req.body.password;
+    user.passwordConfirm = req.body.passwordConfirm;
+    await user.save(); // donot use findByIdAndUpdate because then the presave middleware wont work and also validator wont work
+
+    //4)Login the user and send JWT
+
+    const token = createToken(user.id);
+    res.status(200).json({
+      status: "success",
+      token,
+    });
+  } catch (err) {
+    res.status(400).json({
+      status: "fail",
+      err,
+    });
+    return next(err);
+  }
+};
